@@ -95,12 +95,17 @@ class Stack:
         if tuple(int(p) for p in version.split(".")[:2]) >= (7, 2):
             commands.append("client|setinfo")
         with self.redis_config.open("a") as cfg:
+            # Redis's internal AOF transaction replay uses the disabled default
+            # identity. Login remains impossible; replay needs command/key grants.
+            cfg.write("user default off resetpass ~" + self.prefix + ":* +@all\n")
+            cfg.write("user fixture-admin on >fixture-only-admin-password ~* &* +@all\n")
             cfg.write("user broker on >fixture-only-password ~" + self.prefix + ":* -@all " + " ".join("+" + c for c in commands) + "\n")
         self.binary = Path(OPTIONS.binary).resolve() if OPTIONS.binary else self.directory / "smoothmq"
 
     def redis_command(self, *args):
         return subprocess.check_output([
             OPTIONS.redis_cli, "-h", "127.0.0.1", "-p", str(self.redis_port),
+            "--no-auth-warning", "--user", "fixture-admin", "-a", "fixture-only-admin-password",
             "--raw", *map(str, args),
         ], text=True, stderr=subprocess.DEVNULL).strip()
 
@@ -783,6 +788,33 @@ class CriticAcceptance(unittest.TestCase):
         status, _ = self.raw_http(payload, self.signed_request(payload))
         self.assertEqual(status, 400)
         self.assertEqual(self.raw_http("{}", self.signed_request("{}"))[0], 200)
+
+    def test_25_disabled_default_acl_preserves_aof_transactions(self):
+        def raw_redis(*arguments):
+            return subprocess.check_output([
+                OPTIONS.redis_cli, "-h", "127.0.0.1", "-p", str(self.stack.redis_port),
+                "--no-auth-warning", "--raw", *arguments,
+            ], text=True, stderr=subprocess.STDOUT).strip()
+
+        def access_remains_restricted():
+            self.assertIn("NOAUTH", raw_redis("PING"))
+            self.assertIn("WRONGPASS", raw_redis("--user", "default", "-a", "invalid", "PING"))
+            broker = ["--user", "broker", "-a", "fixture-only-password"]
+            self.assertIn("NOPERM", raw_redis(*broker, "CONFIG", "SET", "appendfsync", "everysec"))
+            self.assertIn("NOPERM", raw_redis(*broker, "GET", "outside-queue-prefix"))
+
+        access_remains_restricted()
+        url = self.queue("disabled-default-replay")
+        bodies = ["aof-message-one", "aof-message-two"]
+        self.a.send_message_batch(QueueUrl=url, Entries=[
+            {"Id": str(i), "MessageBody": body} for i, body in enumerate(bodies)])
+        self.stack.restart(redis=True)
+        self.a, self.b = self.stack.client(0), self.stack.client(1)
+        self.assertCountEqual([m["Body"] for m in self.receive(url, count=10)], bodies)
+        access_remains_restricted()
+        logs = (self.stack.directory / "redis.log").read_text(errors="replace")
+        self.assertNotIn("NOPERM ACLs rules changed", logs)
+        self.assertNotIn("CRITICAL", logs)
 
 
 def main():
