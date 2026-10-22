@@ -111,10 +111,14 @@ func (s *SQS) arnName(arn string) (string, error) {
 	return strings.TrimPrefix(arn, p), nil
 }
 func (s *SQS) reliableAction(c *fiber.Ctx, t int64, b models.Broker) error {
-	if !strings.HasPrefix(c.Get("X-Amz-Target"), "AmazonSQS.") {
+	target, _ := c.Locals("sqsTarget").(string)
+	if !strings.HasPrefix(target, "AmazonSQS.") {
 		return NewSQSError(400, "UnsupportedOperation", "Invalid SQS target")
 	}
-	method := strings.TrimPrefix(c.Get("X-Amz-Target"), "AmazonSQS.")
+	method := strings.TrimPrefix(target, "AmazonSQS.")
+	if err := validateJSONBudget(c.Body()); err != nil {
+		return err
+	}
 	var r brokerRequest
 	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
@@ -573,4 +577,38 @@ func asSQSError(err error) *SQSError {
 		return NewSQSError(status, e.Code, e.Message)
 	}
 	return NewSQSError(503, "ServiceUnavailable", "Queue operation could not complete")
+}
+
+// Bound container expansion before allocating typed slices/maps. A legal large
+// MessageBody is one token, so escaped payloads keep their full supported size.
+func validateJSONBudget(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	depth := 0
+	for count := 0; ; count++ {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return invalid("Malformed JSON")
+		}
+		if count >= 4096 {
+			return invalid("Request JSON structure is too complex")
+		}
+		if count == 0 && token != json.Delim('{') {
+			return invalid("Expected a JSON object")
+		}
+		if delimiter, ok := token.(json.Delim); ok {
+			switch delimiter {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+			if depth > 16 {
+				return invalid("Request JSON nesting is too deep")
+			}
+		}
+	}
 }

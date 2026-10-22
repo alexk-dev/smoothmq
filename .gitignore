@@ -30,7 +30,6 @@ scratch/
 *.sqlite-*
 *.db
 
-smoothmq
 
 # Runtime secrets and local integration artifacts
 deploy/private/

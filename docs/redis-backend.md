@@ -61,3 +61,14 @@ memory, disk space, persistence errors, request latency, readiness, queue/DLQ de
 and application failures. Capacity depends on storage fsync latency and workload;
 functional tests do not constitute a production capacity benchmark. Keep Redis
 private, use TLS for remote access, and protect secrets outside source/images.
+
+## HTTP resource bounds
+
+Both standalone and single-port listeners cap concurrent connections at 32,
+request bodies at 8 MiB (including JSON escaping), header/body reads at 10 seconds,
+response writes at 35 seconds and idle connections at 30 seconds. Budget at least
+2 GiB per broker for the maximum concurrent payload workload; scale replicas for
+more long polls. JSON containers are checked before typed decoding: at most 4,096
+tokens and 16 nesting levels. Repeated HTTP headers are rejected, and dispatch uses
+only the operation target from the validated signature. These bounds reduce
+resource abuse; they do not replace network-level traffic controls.

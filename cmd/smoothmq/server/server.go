@@ -114,7 +114,7 @@ func Run(tm models.TenantManager, queue models.Queue, cfg config.ServerCommand) 
 	var combined *fiber.App
 	var metrics *http.Server
 	if cfg.UseSinglePort {
-		combined = fiber.New(fiber.Config{DisableStartupMessage: true, BodyLimit: cfg.SQS.MaxRequestSize})
+		combined = fiber.New(sqs.HTTPConfig(cfg.SQS.MaxRequestSize))
 		if cfg.SQS.Enabled {
 			combined.Mount("/sqs", sqsServer.App)
 		}

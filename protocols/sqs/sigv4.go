@@ -88,8 +88,8 @@ func ValidateAWSRequest(a AuthHeader, key string, r *http.Request) error {
 	if err != nil || timestamp.UTC().Format("20060102") != a.Date || time.Since(timestamp) > 15*time.Minute || time.Until(timestamp) > 5*time.Minute {
 		return errors.New("expired or invalid signature time")
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
+	payloadHash := sha256.New()
+	if _, err := io.Copy(payloadHash, r.Body); err != nil {
 		return err
 	}
 	defer r.Body.Close()
@@ -114,7 +114,7 @@ func ValidateAWSRequest(a AuthHeader, key string, r *http.Request) error {
 	if uri == "" {
 		uri = "/"
 	}
-	canonical := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s", r.Method, uri, canonicalQuery, headers.String(), strings.Join(a.SignedHeaders, ";"), hashAndEncode(string(body)))
+	canonical := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s", r.Method, uri, canonicalQuery, headers.String(), strings.Join(a.SignedHeaders, ";"), hex.EncodeToString(payloadHash.Sum(nil)))
 	scope := a.Date + "/" + a.Region + "/sqs/aws4_request"
 	signed := a.Algorithm + "\n" + r.Header.Get("X-Amz-Date") + "\n" + scope + "\n" + hashAndEncode(canonical)
 	expected := sign(getSignatureKey(key, a.Date, a.Region, "sqs"), signed)

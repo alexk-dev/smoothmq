@@ -40,6 +40,7 @@ import (
 	"github.com/gofiber/contrib/fiberzerolog"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/utils"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -81,11 +82,10 @@ func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.S
 		cfg:           cfg,
 	}
 
-	app := fiber.New(fiber.Config{
-		DisableStartupMessage: true,
-		ErrorHandler:          s.errorHandler,
-		BodyLimit:             cfg.MaxRequestSize,
-	})
+	httpConfig := HTTPConfig(cfg.MaxRequestSize)
+	httpConfig.ErrorHandler = s.errorHandler
+	app := fiber.New(httpConfig)
+	app.Use(recover.New())
 
 	app.Use(fiberzerolog.New(fiberzerolog.Config{
 		Logger: &log.Logger,
@@ -115,6 +115,20 @@ func (s *SQS) errorHandler(c *fiber.Ctx, err error) error {
 }
 
 func (s *SQS) authMiddleware(c *fiber.Ctx) error {
+	// Different HTTP adapters may select different duplicate values. Never let
+	// signature validation and operation dispatch disagree about the request.
+	seen := map[string]bool{}
+	duplicate := false
+	c.Request().Header.VisitAll(func(key, value []byte) {
+		name := strings.ToLower(string(key))
+		if seen[name] {
+			duplicate = true
+		}
+		seen[name] = true
+	})
+	if duplicate {
+		return ErrIncompleteSignature
+	}
 	r, err := adaptor.ConvertRequest(c, false)
 	if err != nil {
 		return ErrIncompleteSignature
@@ -140,6 +154,7 @@ func (s *SQS) authMiddleware(c *fiber.Ctx) error {
 
 	c.Locals("tenantId", tenantId)
 	c.Locals("accessKey", awsHeader.AccessKey)
+	c.Locals("sqsTarget", r.Header.Get("X-Amz-Target"))
 	return c.Next()
 }
 
@@ -164,11 +179,10 @@ func (s *SQS) Action(c *fiber.Ctx) error {
 	// Never log signed headers or message payloads.
 	start := time.Now()
 
-	awsMethodHeader, ok := c.GetReqHeaders()["X-Amz-Target"]
-	if !ok {
-		return invalid("X-Amz-Target is required")
+	awsMethod, ok := c.Locals("sqsTarget").(string)
+	if !ok || awsMethod == "" {
+		return ErrIncompleteSignature
 	}
-	awsMethod := awsMethodHeader[0]
 	metricMethod := "UnsupportedOperation"
 	switch awsMethod {
 	case "AmazonSQS.SendMessage", "AmazonSQS.SendMessageBatch", "AmazonSQS.ReceiveMessage", "AmazonSQS.DeleteMessage", "AmazonSQS.DeleteMessageBatch", "AmazonSQS.ChangeMessageVisibility", "AmazonSQS.ChangeMessageVisibilityBatch", "AmazonSQS.ListQueues", "AmazonSQS.GetQueueUrl", "AmazonSQS.CreateQueue", "AmazonSQS.GetQueueAttributes", "AmazonSQS.SetQueueAttributes", "AmazonSQS.DeleteQueue", "AmazonSQS.PurgeQueue", "AmazonSQS.ListQueueTags", "AmazonSQS.TagQueue", "AmazonSQS.UntagQueue", "AmazonSQS.StartMessageMoveTask", "AmazonSQS.ListMessageMoveTasks", "AmazonSQS.CancelMessageMoveTask":

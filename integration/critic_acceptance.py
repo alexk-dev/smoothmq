@@ -89,6 +89,13 @@ class Stack:
             'save ""', "maxmemory 256mb", "maxmemory-policy noeviction",
             "stop-writes-on-bgsave-error yes", "daemonize no", "",
         ]))
+        # An isolated administrator remains available only to the fixture.
+        commands = ['ping', 'hello', 'auth', 'select', 'client|setname', 'info', 'config|get', 'eval', 'evalsha', 'script|load', 'script|exists', 'get', 'set', 'del', 'unlink', 'incr', 'hget', 'hset', 'hdel', 'hlen', 'hgetall', 'sadd', 'scard', 'smembers', 'srem', 'sscan', 'zadd', 'zcard', 'zcount', 'zrange', 'zrangebyscore', 'zrem', 'zrevrange', 'time']
+        version = subprocess.check_output([OPTIONS.redis_server, "--version"], text=True).split("v=", 1)[1].split()[0]
+        if tuple(int(p) for p in version.split(".")[:2]) >= (7, 2):
+            commands.append("client|setinfo")
+        with self.redis_config.open("a") as cfg:
+            cfg.write("user broker on >fixture-only-password ~" + self.prefix + ":* -@all " + " ".join("+" + c for c in commands) + "\n")
         self.binary = Path(OPTIONS.binary).resolve() if OPTIONS.binary else self.directory / "smoothmq"
 
     def redis_command(self, *args):
@@ -123,7 +130,7 @@ class Stack:
         self.brokers = []
         for i, port in enumerate(self.ports):
             argv = [str(self.binary), "server", "--backend=redis",
-                    f"--redis-url=redis://127.0.0.1:{self.redis_port}/0",
+                    f"--redis-url=redis://broker:fixture-only-password@127.0.0.1:{self.redis_port}/0",
                     f"--redis-prefix={self.prefix}", "--redis-require-durable=false",
                     "--sqs-host=127.0.0.1", f"--sqs-port={port}",
                     f"--sqs-region={REGION}", f"--sqs-account-id={ACCOUNT}",
@@ -745,6 +752,37 @@ class CriticAcceptance(unittest.TestCase):
                 self.assertFalse(self.receive(url, client=client))
                 client.delete_queue(QueueUrl=url)
                 self.stack.stop_process(process)
+
+
+    def test_23_repeated_signed_headers_are_rejected(self):
+        # Even identical repeated headers are forbidden: HTTP adapters can select
+        # different occurrences. Use only a harmless list operation in this test.
+        payload = "{}"
+        headers = self.signed_request(payload)
+        self.assertEqual(self.raw_http(payload, headers)[0], 200)
+        for repeated in ["X-Amz-Target", "X-Amz-Date", "Authorization"]:
+            connection = http.client.HTTPConnection("127.0.0.1", self.stack.ports[0], timeout=3)
+            try:
+                connection.putrequest("POST", "/")
+                for key, value in headers.items():
+                    connection.putheader(key, value)
+                    if key.lower() == repeated.lower():
+                        connection.putheader(key, value)
+                connection.putheader("Content-Length", str(len(payload)))
+                connection.endheaders(payload.encode())
+                response = connection.getresponse()
+                response.read()
+                self.assertGreaterEqual(response.status, 400)
+                self.assertLess(response.status, 500)
+            finally:
+                connection.close()
+
+    def test_24_structural_json_budget_before_typed_allocation(self):
+        # A small fixture verifies early container limits without a stress test.
+        payload = json.dumps({"Entries": [{}] * 4097})
+        status, _ = self.raw_http(payload, self.signed_request(payload))
+        self.assertEqual(status, 400)
+        self.assertEqual(self.raw_http("{}", self.signed_request("{}"))[0], 200)
 
 
 def main():

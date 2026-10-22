@@ -53,3 +53,8 @@ case 12 is intentionally the only slow case; it must run for final acceptance.
 DLQ automatic transfer preserves the original `SentTimestamp` and source ARN;
 manual redrive creates a new message identity/timestamp and resets the receive
 count. Unsupported FIFO and encryption requests must fail explicitly.
+
+Security regressions additionally reject repeated signed headers and structurally
+oversized JSON containers before typed allocation. Broker connections use a
+restricted Redis ACL; fixture-only administrator access simulates durability and
+outage conditions. See docs/redis-acl.md for the required command set.
