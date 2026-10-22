@@ -31,3 +31,9 @@ scratch/
 *.db
 
 smoothmq
+
+# Runtime secrets and local integration artifacts
+deploy/private/
+__pycache__/
+*.pyc
+/smoothmq

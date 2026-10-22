@@ -17,6 +17,7 @@ aws sqs get-queue-url --debug --queue-name test-queue --endpoint-url http://loca
 */
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -50,7 +51,9 @@ type SQS struct {
 	queue         models.Queue
 	tenantManager models.TenantManager
 
-	cfg config.SQSConfig
+	cfg    config.SQSConfig
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 var requestLatency = promauto.NewHistogramVec(
@@ -71,7 +74,8 @@ var requestStatus = promauto.NewCounterVec(
 )
 
 func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.SQSConfig) *SQS {
-	s := &SQS{
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &SQS{ctx: ctx, cancel: cancel,
 		queue:         queue,
 		tenantManager: tenantManager,
 		cfg:           cfg,
@@ -88,6 +92,15 @@ func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.S
 		Levels: []zerolog.Level{zerolog.ErrorLevel, zerolog.WarnLevel, zerolog.TraceLevel},
 	}))
 
+	app.Get("/health/live", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"state": "ok"}) })
+	app.Get("/health/ready", func(c *fiber.Ctx) error {
+		if b, ok := s.queue.(models.Broker); ok {
+			if err := b.Ready(s.ctx); err != nil {
+				return c.Status(503).JSON(fiber.Map{"state": "unavailable"})
+			}
+		}
+		return c.JSON(fiber.Map{"state": "ready"})
+	})
 	app.Use(s.authMiddleware)
 	app.Post("/*", s.Action)
 
@@ -97,11 +110,7 @@ func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.S
 }
 
 func (s *SQS) errorHandler(c *fiber.Ctx, err error) error {
-	sqsErr, ok := err.(*SQSError)
-	if !ok {
-		sqsErr = NewSQSError(500, "InternalFailure", err.Error())
-	}
-
+	sqsErr := asSQSError(err)
 	return c.Status(sqsErr.Code).JSON(sqsErr)
 }
 
@@ -116,6 +125,9 @@ func (s *SQS) authMiddleware(c *fiber.Ctx) error {
 		return ErrIncompleteSignature
 	}
 
+	if awsHeader.Region != s.cfg.Region {
+		return ErrInvalidClientTokenId
+	}
 	tenantId, secretKey, err := s.tenantManager.GetAWSSecretKey(awsHeader.AccessKey, awsHeader.Region)
 	if err != nil {
 		return ErrInvalidClientTokenId
@@ -127,6 +139,7 @@ func (s *SQS) authMiddleware(c *fiber.Ctx) error {
 	}
 
 	c.Locals("tenantId", tenantId)
+	c.Locals("accessKey", awsHeader.AccessKey)
 	return c.Next()
 }
 
@@ -140,6 +153,7 @@ func (s *SQS) Start() error {
 }
 
 func (s *SQS) Stop() error {
+	s.cancel()
 	if s.cfg.Enabled {
 		return s.App.Shutdown()
 	}
@@ -147,14 +161,19 @@ func (s *SQS) Stop() error {
 }
 
 func (s *SQS) Action(c *fiber.Ctx) error {
-	log.Trace().Interface("headers", c.GetReqHeaders()).Bytes("body", c.Body()).Send()
+	// Never log signed headers or message payloads.
 	start := time.Now()
 
 	awsMethodHeader, ok := c.GetReqHeaders()["X-Amz-Target"]
 	if !ok {
-		return errors.New("X-Amz-Target header not found")
+		return invalid("X-Amz-Target is required")
 	}
 	awsMethod := awsMethodHeader[0]
+	metricMethod := "UnsupportedOperation"
+	switch awsMethod {
+	case "AmazonSQS.SendMessage", "AmazonSQS.SendMessageBatch", "AmazonSQS.ReceiveMessage", "AmazonSQS.DeleteMessage", "AmazonSQS.DeleteMessageBatch", "AmazonSQS.ChangeMessageVisibility", "AmazonSQS.ChangeMessageVisibilityBatch", "AmazonSQS.ListQueues", "AmazonSQS.GetQueueUrl", "AmazonSQS.CreateQueue", "AmazonSQS.GetQueueAttributes", "AmazonSQS.SetQueueAttributes", "AmazonSQS.DeleteQueue", "AmazonSQS.PurgeQueue", "AmazonSQS.ListQueueTags", "AmazonSQS.TagQueue", "AmazonSQS.UntagQueue", "AmazonSQS.StartMessageMoveTask", "AmazonSQS.ListMessageMoveTasks", "AmazonSQS.CancelMessageMoveTask":
+		metricMethod = awsMethod
+	}
 
 	var r *http.Request = &http.Request{}
 	fasthttpadaptor.ConvertRequest(c.Context(), r, false)
@@ -162,10 +181,21 @@ func (s *SQS) Action(c *fiber.Ctx) error {
 	tenantId := c.Locals("tenantId").(int64)
 
 	defer func() {
-		requestLatency.WithLabelValues(fmt.Sprintf("%d", tenantId), utils.CopyString(awsMethod)).Observe(time.Since(start).Seconds())
+		requestLatency.WithLabelValues(fmt.Sprintf("%d", tenantId), utils.CopyString(metricMethod)).Observe(time.Since(start).Seconds())
 	}()
 
 	var rc error
+	defer func() {
+		status := "ok"
+		if rc != nil {
+			status = "error"
+		}
+		requestStatus.WithLabelValues(fmt.Sprintf("%d", tenantId), utils.CopyString(metricMethod), status).Inc()
+	}()
+	if broker, ok := s.queue.(models.Broker); ok {
+		rc = s.reliableAction(c, tenantId, broker)
+		return rc
+	}
 	switch awsMethod {
 	case "AmazonSQS.SendMessage":
 		rc = s.SendMessage(c, tenantId)
@@ -190,12 +220,6 @@ func (s *SQS) Action(c *fiber.Ctx) error {
 	default:
 		rc = NewSQSError(400, "UnsupportedOperation", fmt.Sprintf("SQS method %s not implemented", awsMethod))
 	}
-
-	status := "ok"
-	if rc != nil {
-		status = "error"
-	}
-	requestStatus.WithLabelValues(fmt.Sprintf("%d", tenantId), utils.CopyString(awsMethod), status).Inc()
 
 	return rc
 }
@@ -290,13 +314,13 @@ func (s *SQS) CreateQueue(c *fiber.Ctx, tenantId int64) error {
 }
 
 func (s *SQS) queueURL(c *fiber.Ctx, tenantId int64, queue string) string {
-	host := fmt.Sprintf("%s://%s", c.Protocol(), c.Hostname())
+	host := fmt.Sprintf("%s://%s%s", c.Protocol(), c.Hostname(), s.cfg.BasePath)
 
 	if s.cfg.EndpointOverride != "" {
-		host = s.cfg.EndpointOverride
+		host = strings.TrimRight(s.cfg.EndpointOverride, "/")
 	}
 
-	return fmt.Sprintf("%s/%d/%s", host, tenantId, queue)
+	return fmt.Sprintf("%s/%s/%s", host, s.cfg.AccountID, queue)
 
 }
 func (s *SQS) ListQueues(c *fiber.Ctx, tenantId int64) error {

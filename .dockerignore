@@ -30,3 +30,7 @@
 **/*.sqlite
 **/*.db
 fly.toml
+
+.git
+**/__pycache__
+**/private

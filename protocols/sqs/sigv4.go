@@ -8,119 +8,119 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
+	"time"
 )
 
 type AuthHeader struct {
-	Algorithm     string
-	AccessKey     string
-	Date          string
-	SignedHeaders []string
-	Signature     string
-	Region        string
-	Service       string
+	Algorithm, AccessKey, Date, Signature, Region, Service string
+	SignedHeaders                                          []string
 }
 
 func ParseAuthorizationHeader(r *http.Request) (AuthHeader, error) {
-
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return AuthHeader{}, errors.New("Authorization header is missing")
+	var out AuthHeader
+	parts := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
+	if len(parts) != 2 || parts[0] != "AWS4-HMAC-SHA256" {
+		return out, errors.New("invalid authorization algorithm")
 	}
-
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 {
-		return AuthHeader{}, errors.New("invalid Authorization header format")
-	}
-
-	rc := AuthHeader{}
-	rc.Algorithm = parts[0]
-
-	componentsString := parts[1]
-
-	components := strings.Split(componentsString, ",")
-	for _, componentString := range components {
-		kv := strings.Split(strings.TrimSpace(componentString), "=")
-
-		if strings.EqualFold(kv[0], "Credential") {
-			tokens := strings.Split(kv[1], "/")
-			rc.AccessKey = tokens[0]
-			rc.Date = tokens[1]
-			rc.Region = tokens[2]
-			rc.Service = tokens[3]
-		} else if strings.EqualFold(kv[0], "SignedHeaders") {
-			rc.SignedHeaders = strings.Split(kv[1], ";")
-		} else if strings.EqualFold(kv[0], "Signature") {
-			rc.Signature = kv[1]
+	out.Algorithm = parts[0]
+	seen := map[string]bool{}
+	for _, component := range strings.Split(parts[1], ",") {
+		kv := strings.SplitN(strings.TrimSpace(component), "=", 2)
+		if len(kv) != 2 || seen[kv[0]] {
+			return out, errors.New("invalid authorization fields")
 		}
-
+		seen[kv[0]] = true
+		switch kv[0] {
+		case "Credential":
+			scope := strings.Split(kv[1], "/")
+			if len(scope) != 5 || scope[0] == "" || len(scope[1]) != 8 || scope[2] == "" || scope[3] != "sqs" || scope[4] != "aws4_request" {
+				return out, errors.New("invalid credential scope")
+			}
+			out.AccessKey = scope[0]
+			out.Date = scope[1]
+			out.Region = scope[2]
+			out.Service = scope[3]
+		case "SignedHeaders":
+			out.SignedHeaders = strings.Split(kv[1], ";")
+		case "Signature":
+			out.Signature = kv[1]
+		default:
+			return out, errors.New("unknown authorization field")
+		}
 	}
-
-	return rc, nil
+	if len(seen) != 3 || len(out.Signature) != 64 || len(out.SignedHeaders) == 0 {
+		return out, errors.New("incomplete signature")
+	}
+	if _, err := hex.DecodeString(out.Signature); err != nil {
+		return out, errors.New("invalid signature encoding")
+	}
+	required := map[string]bool{"host": false, "x-amz-date": false, "x-amz-target": false}
+	previous := ""
+	for _, h := range out.SignedHeaders {
+		if h == "" || h != strings.ToLower(h) || h <= previous {
+			return out, errors.New("invalid signed headers")
+		}
+		previous = h
+		if _, ok := required[h]; ok {
+			required[h] = true
+		}
+	}
+	for _, present := range required {
+		if !present {
+			return out, errors.New("required header is unsigned")
+		}
+	}
+	return out, nil
 }
-
-func getSignatureKey(key, dateStamp, region, service string) []byte {
-	kSecret := []byte(fmt.Sprintf("AWS4%s", key))
-	kDate := sign(kSecret, dateStamp)
-	kRegion := sign(kDate, region)
-	kService := sign(kRegion, service)
-	kSigning := sign(kService, "aws4_request")
-	return kSigning
-}
-
 func sign(key []byte, message string) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(message))
 	return h.Sum(nil)
 }
-
-func hashAndEncode(s string) string {
-	h := sha256.New()
-	h.Write([]byte(s))
-	return hex.EncodeToString(h.Sum(nil))
+func getSignatureKey(key, date, region, service string) []byte {
+	return sign(sign(sign(sign([]byte("AWS4"+key), date), region), service), "aws4_request")
 }
-
-func ValidateAWSRequest(awsCreds AuthHeader, secretKey string, r *http.Request) error {
+func hashAndEncode(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+func ValidateAWSRequest(a AuthHeader, key string, r *http.Request) error {
+	timestamp, err := time.Parse("20060102T150405Z", r.Header.Get("X-Amz-Date"))
+	if err != nil || timestamp.UTC().Format("20060102") != a.Date || time.Since(timestamp) > 15*time.Minute || time.Until(timestamp) > 5*time.Minute {
+		return errors.New("expired or invalid signature time")
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return err
 	}
-
 	defer r.Body.Close()
-
-	payloadHash := hashAndEncode(string(body))
-
-	canonicalHeaders := strings.Builder{}
-	for _, header := range awsCreds.SignedHeaders {
-		canonicalHeaders.WriteString(header)
-		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(r.Header.Get(header))
-		canonicalHeaders.WriteString("\n")
+	var headers strings.Builder
+	for _, name := range a.SignedHeaders {
+		value := r.Header.Get(name)
+		if name == "host" && value == "" {
+			value = r.Host
+		}
+		if value == "" {
+			return errors.New("signed header missing")
+		}
+		headers.WriteString(name + ":" + strings.Join(strings.Fields(value), " ") + "\n")
 	}
-
-	signedHeaders := strings.Join(awsCreds.SignedHeaders, ";")
-
-	canonicalRequest := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
-		strings.ToUpper(r.Method), r.URL, "", canonicalHeaders.String(), signedHeaders, payloadHash)
-
-	canonicalRequestHash := hashAndEncode(canonicalRequest)
-	credentialScope := fmt.Sprintf("%s/%s/sqs/aws4_request",
-		awsCreds.Date, awsCreds.Region)
-
-	stringToSign := fmt.Sprintf("%s\n%s\n%s\n%s",
-		awsCreds.Algorithm, r.Header.Get("x-amz-date"), credentialScope, canonicalRequestHash)
-
-	signingKey := getSignatureKey(secretKey, awsCreds.Date, awsCreds.Region, "sqs")
-
-	signatureSHA := hmac.New(sha256.New, signingKey)
-	signatureSHA.Write([]byte(stringToSign))
-	signatureString := hex.EncodeToString(signatureSHA.Sum(nil))
-
-	// authorizationHeader := fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s", awsCreds.Algorithm, awsCreds.AccessKey, credentialScope, signedHeaders, signatureString)
-
-	if signatureString == awsCreds.Signature {
-		return nil
+	// Query encoding is sorted per SigV4. SQS JSON ordinarily has no query string.
+	query := r.URL.Query()
+	for k := range query {
+		sort.Strings(query[k])
 	}
-
-	return errors.New("invalid signature")
+	canonicalQuery := strings.ReplaceAll(query.Encode(), "+", "%20")
+	uri := r.URL.EscapedPath()
+	if uri == "" {
+		uri = "/"
+	}
+	canonical := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s", r.Method, uri, canonicalQuery, headers.String(), strings.Join(a.SignedHeaders, ";"), hashAndEncode(string(body)))
+	scope := a.Date + "/" + a.Region + "/sqs/aws4_request"
+	signed := a.Algorithm + "\n" + r.Header.Get("X-Amz-Date") + "\n" + scope + "\n" + hashAndEncode(canonical)
+	expected := sign(getSignatureKey(key, a.Date, a.Region, "sqs"), signed)
+	got, _ := hex.DecodeString(a.Signature)
+	if !hmac.Equal(expected, got) {
+		return errors.New("invalid signature")
+	}
+	return nil
 }

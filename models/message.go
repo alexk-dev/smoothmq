@@ -35,10 +35,14 @@ type Message struct {
 	TenantID int64 `db:"tenant_id"`
 	QueueID  int64 `db:"queue_id"`
 
-	DeliverAt   int `db:"deliver_at"`
-	DeliveredAt int `db:"delivered_at"`
-	Tries       int `db:"tries"`
-	MaxTries    int `db:"max_tries"`
+	DeliverAt             int `db:"deliver_at"`
+	DeliveredAt           int `db:"delivered_at"`
+	Tries                 int `db:"tries"`
+	MaxTries              int `db:"max_tries"`
+	ReceiptHandle         string
+	SentTimestamp         int64
+	FirstReceiveTimestamp int64
+	SourceARN             string
 	// RequeueIn   int `db:"requeue_in"`
 
 	// Status MessageStatus `db:"status"`

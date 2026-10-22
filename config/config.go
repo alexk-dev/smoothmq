@@ -30,10 +30,12 @@ type TesterCommand struct {
 type ServerCommand struct {
 	SQS       SQSConfig       `embed:"" prefix:"sqs-" envprefix:"Q_SQS_"`
 	Dashboard DashboardConfig `embed:"" prefix:"dashboard-" envprefix:"Q_DASHBOARD_"`
+	Redis     RedisConfig     `embed:"" prefix:"redis-" envprefix:"Q_REDIS_"`
+	Backend   string          `name:"backend" default:"redis" enum:"redis" env:"Q_BACKEND"`
 	SQLite    SQLiteConfig    `embed:"" prefix:"sqlite-" envprefix:"Q_SQLITE_"`
 	Metrics   MetricsConfig   `embed:"" prefix:"metrics-" name:"metrics" envprefix:"Q_METRICS_"`
 
-	DisableTelemetry bool   `name:"disable-telemetry" default:"false" env:"DISABLE_TELEMETRY"`
+	DisableTelemetry bool   `name:"disable-telemetry" default:"true" env:"DISABLE_TELEMETRY"`
 	UseSinglePort    bool   `name:"use-single-port" default:"false" env:"Q_SERVER_USE_SINGLE_PORT" help:"Enables having all HTTP services run on a single port with different endpoints"`
 	Port             int    `name:"port" default:"8080" env:"PORT" help:"If use-single-port is enabled, this is the port number for the server"`
 	Host             string `name:"host" env:"HOST" help:"If use-single-port is enabled, this is the hostname or ip address for the server"`
@@ -51,17 +53,28 @@ type MetricsConfig struct {
 	PrometheusPath    string `name:"prometheus-path" default:"/metrics" env:"PROMETHEUS_PATH"`
 }
 
+type RedisConfig struct {
+	URLFile        string `name:"url-file" env:"URL_FILE" help:"Read Redis URL from a mounted secret file"`
+	URL            string `name:"url" default:"redis://localhost:6379/0" env:"URL"`
+	Prefix         string `name:"prefix" default:"smoothmq" env:"PREFIX"`
+	RequireDurable bool   `name:"require-durable" default:"true" env:"REQUIRE_DURABLE" help:"Require healthy AOF always and noeviction; disable only for development"`
+}
+
 type SQLiteConfig struct {
 	Path string `name:"path" help:"Path of SQLite file" default:"smoothmq.sqlite" env:"PATH"`
 }
 
 type SQSConfig struct {
+	BasePath         string   `kong:"-"`
+	Region           string   `name:"region" default:"eu-central-1" env:"REGION"`
+	AccountID        string   `name:"account-id" default:"000000000001" env:"ACCOUNT_ID"`
+	PolicyFile       string   `name:"policy-file" env:"POLICY_FILE" help:"JSON per-key action and queue permissions"`
 	Enabled          bool     `name:"enabled" default:"true" help:"Enable SQS protocol for queue" env:"ENABLED"`
 	Host             string   `name:"host" default:"localhost" help:"hostname or ip address for SQS protocol" env:"HOST"`
 	Port             int      `name:"port" default:"3001" help:"HTTP port for SQS protocol" env:"PORT"`
 	Keys             []AWSKey `name:"keys" default:"DEV_ACCESS_KEY_ID:DEV_SECRET_ACCESS_KEY" env:"KEYS"`
 	ParseCelery      bool     `name:"parse-celery" default:"true" env:"PARSE_CELERY" help:"Parse Celery messages. Lets you search by celery message ID and task type."`
-	MaxRequestSize   int      `name:"max-request-size" default:"1048576" env:"MAX_REQUEST_SIZE" help:"Max size of SQS request in bytes"`
+	MaxRequestSize   int      `name:"max-request-size" default:"8388608" env:"MAX_REQUEST_SIZE" help:"Max size of SQS request in bytes"`
 	MaxDelaySeconds  int      `name:"max-delay-seconds" default:"30" env:"MAX_DELAY_SECONDS" help:"Max allowed wait time for long polling"`
 	DelayRetryMillis int      `name:"delay-retry-millis" default:"1000" env:"DELAY_RETRY_MILLIS" help:"When long polling, how often to request new items"`
 	EndpointOverride string   `name:"endpoint-override" default:"" env:"ENDPOINT_OVERRIDE" help:"Endpoint to advertise in queue URLs. Defaults to HTTP hostname."`
@@ -92,7 +105,7 @@ func (k *AWSKey) Decode(ctx *kong.DecodeContext) error {
 }
 
 type DashboardConfig struct {
-	Enabled bool   `name:"enabled" help:"Enable web dashboard" default:"true" env:"ENABLED"`
+	Enabled bool   `name:"enabled" help:"Enable web dashboard" default:"false" env:"ENABLED"`
 	Host    string `name:"host" help:"hostname or ip address for dashboard" default:"localhost" env:"HOST"`
 	Port    int    `name:"port" help:"HTTP port for dashboard" default:"3000" env:"PORT"`
 	Dev     bool   `name:"dev" help:"Run dashboard in dev mode, refresh templates from local" default:"false" env:"DEV"`
