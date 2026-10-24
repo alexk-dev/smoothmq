@@ -49,6 +49,7 @@ import (
 
 type SQS struct {
 	App           *fiber.App
+	HealthApp     *fiber.App
 	queue         models.Queue
 	tenantManager models.TenantManager
 
@@ -82,7 +83,7 @@ func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.S
 		cfg:           cfg,
 	}
 
-	httpConfig := HTTPConfig(cfg.MaxRequestSize)
+	httpConfig := HTTPConfig(cfg.MaxRequestSize, cfg.MaxConnections)
 	httpConfig.ErrorHandler = s.errorHandler
 	app := fiber.New(httpConfig)
 	app.Use(recover.New())
@@ -92,6 +93,23 @@ func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.S
 		Levels: []zerolog.Level{zerolog.ErrorLevel, zerolog.WarnLevel, zerolog.TraceLevel},
 	}))
 
+	s.registerHealth(app)
+	app.Use(s.authMiddleware)
+	app.Post("/*", s.Action)
+
+	s.App = app
+	if cfg.Enabled && cfg.HealthPort != 0 {
+		// Health connections must never compete with long polls for admission.
+		s.HealthApp = fiber.New(HTTPConfig(1024, 32))
+		s.HealthApp.Use(recover.New())
+		s.registerHealth(s.HealthApp)
+	}
+
+	return s
+}
+
+// registerHealth keeps probe semantics identical on every listener.
+func (s *SQS) registerHealth(app *fiber.App) {
 	app.Get("/health/live", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"state": "ok"}) })
 	app.Get("/health/ready", func(c *fiber.Ctx) error {
 		if b, ok := s.queue.(models.Broker); ok {
@@ -101,12 +119,14 @@ func NewSQS(queue models.Queue, tenantManager models.TenantManager, cfg config.S
 		}
 		return c.JSON(fiber.Map{"state": "ready"})
 	})
-	app.Use(s.authMiddleware)
-	app.Post("/*", s.Action)
+}
 
-	s.App = app
-
-	return s
+// StartHealth uses the active SQS listener host (the combined host in single-port mode).
+func (s *SQS) StartHealth(host string) error {
+	if s.HealthApp == nil {
+		return nil
+	}
+	return s.HealthApp.Listen(fmt.Sprintf("%s:%d", host, s.cfg.HealthPort))
 }
 
 func (s *SQS) errorHandler(c *fiber.Ctx, err error) error {
@@ -169,8 +189,12 @@ func (s *SQS) Start() error {
 
 func (s *SQS) Stop() error {
 	s.cancel()
+	var healthErr error
+	if s.HealthApp != nil {
+		healthErr = s.HealthApp.Shutdown()
+	}
 	if s.cfg.Enabled {
-		return s.App.Shutdown()
+		return errors.Join(healthErr, s.App.Shutdown())
 	}
 	return nil
 }

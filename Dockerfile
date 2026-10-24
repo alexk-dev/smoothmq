@@ -18,6 +18,6 @@ RUN /opt/tests/bin/python integration/critic_acceptance.py --binary /tmp/smoothm
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88 AS runtime
 COPY --from=builder /smoothmq /smoothmq
-EXPOSE 3001 2112
+EXPOSE 3001 3002 2112
 ENTRYPOINT ["/smoothmq"]
 CMD ["server"]

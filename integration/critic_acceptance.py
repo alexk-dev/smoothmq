@@ -61,6 +61,7 @@ class Stack:
         self.prefix = "critic-" + uuid.uuid4().hex[:12]
         self.redis_port = free_port()
         self.ports = [free_port(), free_port()]
+        self.health_ports = [free_port(), free_port()]
         self.brokers = []
         self.redis = None
         self.logs = []
@@ -138,6 +139,7 @@ class Stack:
                     f"--redis-url=redis://broker:fixture-only-password@127.0.0.1:{self.redis_port}/0",
                     f"--redis-prefix={self.prefix}", "--redis-require-durable=false",
                     "--sqs-host=127.0.0.1", f"--sqs-port={port}",
+                    f"--sqs-health-port={self.health_ports[i]}",
                     f"--sqs-region={REGION}", f"--sqs-account-id={ACCOUNT}",
                     f"--sqs-policy-file={self.policy}", "--dashboard-enabled=false",
                     "--metrics-prometheus-enabled=false", "--disable-telemetry"]
@@ -683,7 +685,8 @@ class CriticAcceptance(unittest.TestCase):
             argv = ["--redis-require-durable=true" if argument == "--redis-require-durable=false" else argument
                     for argument in argv]
             probe_port = free_port()
-            argv = [f"--sqs-port={probe_port}" if argument.startswith("--sqs-port=") else argument
+            argv = [f"--sqs-port={probe_port}" if argument.startswith("--sqs-port=") else
+                    "--sqs-health-port=0" if argument.startswith("--sqs-health-port=") else argument
                     for argument in argv]
             process = self.stack.spawn(argv, "unsafe-production-startup.log")
             try:
@@ -736,13 +739,19 @@ class CriticAcceptance(unittest.TestCase):
             with self.subTest(endpoint_override=use_override):
                 port = free_port()
                 endpoint = f"http://127.0.0.1:{port}/sqs"
-                argv = list(self.stack.brokers[0].args) + [
+                health_port = free_port()
+                argv = [f"--sqs-health-port={health_port}" if arg.startswith("--sqs-health-port=") else
+                        "--sqs-host=127.0.0.2" if arg.startswith("--sqs-host=") else arg
+                        for arg in self.stack.brokers[0].args] + [
                     "--use-single-port=true", "--host=127.0.0.1", f"--port={port}"]
                 if use_override:
                     argv.append(f"--sqs-endpoint-override={endpoint}")
                 process = self.stack.spawn(argv, f"broker-single-port-{int(use_override)}.log")
                 self.stack.brokers.append(process)
                 self.stack.wait_port(process, port)
+                self.stack.wait_port(process, health_port)
+                self.assert_health(health_port)
+                self.assert_health(port, "/sqs/health")
                 client = boto3.client("sqs", endpoint_url=endpoint, region_name=REGION,
                                       aws_access_key_id="admin", aws_secret_access_key=SECRET,
                                       config=Config(connect_timeout=2, read_timeout=5,
@@ -758,6 +767,55 @@ class CriticAcceptance(unittest.TestCase):
                 client.delete_queue(QueueUrl=url)
                 self.stack.stop_process(process)
 
+
+    def assert_health(self, port, prefix="/health"):
+        for path, state in [("/live", "ok"), ("/ready", "ready")]:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            try:
+                connection.request("GET", prefix + path)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read()), {"state": state})
+            finally:
+                connection.close()
+
+    def test_22a_health_listener_lifecycle(self):
+        for port in self.stack.health_ports:
+            self.assert_health(port)
+        # Disabling the listener must permit startup even if the usual health
+        # port is occupied, while keeping the original main-port endpoints.
+        port = free_port()
+        argv = [f"--sqs-port={port}" if arg.startswith("--sqs-port=") else
+                "--sqs-health-port=0" if arg.startswith("--sqs-health-port=") else arg
+                for arg in self.stack.brokers[0].args]
+        process = self.stack.spawn(argv, "broker-health-disabled.log")
+        self.stack.brokers.append(process)
+        try:
+            self.stack.wait_port(process, port)
+            self.assert_health(port)
+        finally:
+            self.assertTrue(self.stack.stop_process(process))
+        self.assertEqual(process.returncode, 0)
+
+        # A health bind error is fatal in both listener modes, and tears down
+        # the main listener through the same shutdown path as other failures.
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            health_port = occupied.getsockname()[1]
+            for single in [False, True]:
+                with self.subTest(single_port=single):
+                    port = free_port()
+                    argv = [f"--sqs-port={port}" if arg.startswith("--sqs-port=") else
+                            f"--sqs-health-port={health_port}" if arg.startswith("--sqs-health-port=") else arg
+                            for arg in self.stack.brokers[0].args]
+                    if single:
+                        argv += ["--use-single-port=true", "--host=127.0.0.1", f"--port={port}"]
+                    process = self.stack.spawn(argv, f"broker-health-busy-{single}.log")
+                    self.stack.brokers.append(process)
+                    self.assertNotEqual(process.wait(timeout=8), 0)
+                    with self.assertRaises(OSError):
+                        socket.create_connection(("127.0.0.1", port), timeout=0.2)
 
     def test_23_repeated_signed_headers_are_rejected(self):
         # Even identical repeated headers are forbidden: HTTP adapters can select

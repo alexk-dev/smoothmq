@@ -1,5 +1,13 @@
 ---
 server:
+  # Concurrent SQS connections, including long polls and idle keep-alives.
+  # Valid: 1..65536; raise only with enough memory/sockets/backend capacity.
+  # Also controls the combined listener in single-port mode.
+  sqs-max-connections: 1024
+  # Dedicated health listener, 0 disables; valid: 0..65535.
+  # Kubernetes probes should use this port; main-port health remains available.
+  # Uses sqs-host normally, host in single-port mode; only runs if SQS is enabled.
+  sqs-health-port: 3002
   sqs:
     enabled: true
     port: 3001
