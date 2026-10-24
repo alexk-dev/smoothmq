@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/alecthomas/kong"
@@ -65,6 +66,8 @@ type SQLiteConfig struct {
 }
 
 type SQSConfig struct {
+	MaxConnections   int      `name:"max-connections" default:"1024" env:"MAX_CONNECTIONS" help:"Maximum concurrent SQS HTTP connections (1..65536), including idle connections and long polls"`
+	HealthPort       int      `name:"health-port" default:"3002" env:"HEALTH_PORT" help:"Dedicated health HTTP port (0 disables, 1..65535)"`
 	BasePath         string   `kong:"-"`
 	Region           string   `name:"region" default:"eu-central-1" env:"REGION"`
 	AccountID        string   `name:"account-id" default:"000000000001" env:"ACCOUNT_ID"`
@@ -78,6 +81,17 @@ type SQSConfig struct {
 	MaxDelaySeconds  int      `name:"max-delay-seconds" default:"30" env:"MAX_DELAY_SECONDS" help:"Max allowed wait time for long polling"`
 	DelayRetryMillis int      `name:"delay-retry-millis" default:"1000" env:"DELAY_RETRY_MILLIS" help:"When long polling, how often to request new items"`
 	EndpointOverride string   `name:"endpoint-override" default:"" env:"ENDPOINT_OVERRIDE" help:"Endpoint to advertise in queue URLs. Defaults to HTTP hostname."`
+}
+
+// Validate is called by Kong for flags, environment variables and YAML config.
+func (c SQSConfig) Validate() error {
+	if c.MaxConnections < 1 || c.MaxConnections > 65536 {
+		return fmt.Errorf("sqs-max-connections must be between 1 and 65536 (got %d)", c.MaxConnections)
+	}
+	if c.HealthPort < 0 || c.HealthPort > 65535 {
+		return fmt.Errorf("sqs-health-port must be between 0 and 65535 (got %d)", c.HealthPort)
+	}
+	return nil
 }
 
 type AWSKey struct {

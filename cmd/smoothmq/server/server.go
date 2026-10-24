@@ -51,6 +51,10 @@ func recordTelemetry(message string, disabled bool) {
 }
 
 func Run(tm models.TenantManager, queue models.Queue, cfg config.ServerCommand) {
+	if err := cfg.SQS.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if !regexp.MustCompile(`^[0-9]{12}$`).MatchString(cfg.SQS.AccountID) || !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(cfg.SQS.Region) {
 		fmt.Fprintln(os.Stderr, "Invalid SQS account ID or region")
 		os.Exit(1)
@@ -103,7 +107,7 @@ func Run(tm models.TenantManager, queue models.Queue, cfg config.ServerCommand) 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
-	failures := make(chan error, 3)
+	failures := make(chan error, 4)
 	start := func(fn func() error) {
 		go func() {
 			if err := fn(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -114,7 +118,7 @@ func Run(tm models.TenantManager, queue models.Queue, cfg config.ServerCommand) 
 	var combined *fiber.App
 	var metrics *http.Server
 	if cfg.UseSinglePort {
-		combined = fiber.New(sqs.HTTPConfig(cfg.SQS.MaxRequestSize))
+		combined = fiber.New(sqs.HTTPConfig(cfg.SQS.MaxRequestSize, cfg.SQS.MaxConnections))
 		if cfg.SQS.Enabled {
 			combined.Mount("/sqs", sqsServer.App)
 		}
@@ -138,6 +142,13 @@ func Run(tm models.TenantManager, queue models.Queue, cfg config.ServerCommand) 
 			metrics = &http.Server{Addr: fmt.Sprintf("%s:%d", cfg.Metrics.PrometheusHost, cfg.Metrics.PrometheusPort), Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 			start(metrics.ListenAndServe)
 		}
+	}
+	if cfg.SQS.Enabled && cfg.SQS.HealthPort != 0 {
+		healthHost := cfg.SQS.Host
+		if cfg.UseSinglePort {
+			healthHost = cfg.Host
+		}
+		start(func() error { return sqsServer.StartHealth(healthHost) })
 	}
 	failed := false
 	select {

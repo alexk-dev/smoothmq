@@ -64,11 +64,26 @@ private, use TLS for remote access, and protect secrets outside source/images.
 
 ## HTTP resource bounds
 
-Both standalone and single-port listeners cap concurrent connections at 32,
-request bodies at 8 MiB (including JSON escaping), header/body reads at 10 seconds,
-response writes at 35 seconds and idle connections at 30 seconds. Budget at least
-2 GiB per broker for the maximum concurrent payload workload; scale replicas for
-more long polls. JSON containers are checked before typed decoding: at most 4,096
+Both standalone and single-port listeners use `--sqs-max-connections`
+(`Q_SQS_MAX_CONNECTIONS`, default 1024, range 1–65536) to cap concurrent connections,
+including idle keep-alives and long polls. They cap request bodies at 8 MiB (including JSON escaping), header/body reads at 10 seconds,
+response writes at 35 seconds and idle connections at 30 seconds. Budget memory for concurrency times payload size, plus HTTP/JSON
+allocation overhead and backend work. At 1024 simultaneous maximum-size requests
+this can require many GiB; choose limits from measured workloads and available
+sockets, memory and Redis capacity. JSON containers are checked before typed decoding: at most 4,096
 tokens and 16 nesting levels. Repeated HTTP headers are rejected, and dispatch uses
 only the operation target from the validated signature. These bounds reduce
 resource abuse; they do not replace network-level traffic controls.
+
+
+`--sqs-health-port` (`Q_SQS_HEALTH_PORT`, default 3002, range 0–65535; 0 disables)
+provides `/health/live` and `/health/ready` on an independent 32-connection listener.
+Use it for Kubernetes probes so SQS connection exhaustion cannot reject them
+before routing. It shares the active SQS host binding (`--sqs-host`, or `--host`
+for single-port mode) and remains separate even in single-port mode. It starts
+only when SQS is enabled, fails startup on bind errors, and shuts down with SQS.
+Readiness still calls `Broker.Ready`: Redis PING plus the configured durability
+checks, with the existing one-second durability cache. Liveness does not depend
+on Redis. Original main-port health routes remain compatible (port 3001 normally,
+`/sqs/health/*` on the combined port); metrics on 2112 are unchanged. Main-port
+probes still share the SQS connection budget, so migrate probes to port 3002.
